@@ -110,14 +110,48 @@ static void qrun_lexer_destroy(qrun_lexer_t* lex)
 
 static int qrun_next_line(qrun_lexer_t* lex)
 {
+    int n;
+    int finished;
+    int eof;
+    char* p;
+    char one[2];
     do {
-        if (!fgets(lex->line, 256, lex->f)) {
-            return 0;
+        /* The Microware library's fgets() treats CR as the line separator;
+           host tools normally produce LF and Windows adds CRLF.  Asking for
+           at most one byte lets us define the line convention here and makes
+           the IR format portable across OS-9, Unix, and Windows. */
+        n = 0;
+        finished = 0;
+        eof = 0;
+        while (n < 255 && finished == 0) {
+            if (!fgets(one, 2, lex->f)) {
+                finished = 1;
+                eof = 1;
+            } else {
+                if (one[0] == '\n') {
+                    lex->line[n] = '\0';
+                    finished = 1;
+                } else {
+                    if (one[0] == '\r') {
+                        lex->line[n] = '\0';
+                        finished = 1;
+                    } else {
+                        lex->line[n] = one[0];
+                        n++;
+                    }
+                }
+            }
         }
+        if (eof) {
+            if (n == 0) {
+                return 0;
+            }
+        }
+        lex->line[n] = '\0';
         /* Skip comments and empty lines */
-        char* p = lex->line;
+        p = lex->line;
         while (isspace(*p)) p++;
-        if (*p == ';' || *p == '#' || *p == '\0' || *p == '\n') {
+        if (*p == ';' || *p == '#' || *p == '\0') {
             continue;
         }
         lex->tok = p;
@@ -161,7 +195,44 @@ static qrun_opcode_t qrun_opcode_from_string(const char* s)
                 if (s[2] == '\0') return OP_HALT;
             }
         }
-    }
+        /* Keep the core opcodes independent of the target string-compare
+           path.  This is also valid for the C89/QCC bootstrap frontend,
+           where a long chain of strcmp() calls can collapse branch results. */
+        if (s[0] == 'F') {
+            if (s[1] == 'U') return OP_FUNC;
+        }
+        if (s[0] == 'E') {
+            if (s[1] == 'N') return OP_ENDFUNC;
+        }
+        if (s[0] == 'P') {
+            if (s[1] == 'U') return OP_PUSH;
+            if (s[1] == 'R') return OP_PRINT;
+        }
+        if (s[0] == 'L') {
+            if (s[1] == 'A') {
+                if (s[2] == 'B') return OP_LABEL;
+                if (s[2] == 'R') return OP_LARRAY;
+            }
+            if (s[1] == 'O') {
+                if (s[4] == 'I') return OP_LOADIDX;
+                return OP_LOADL;
+            }
+        }
+        if (s[0] == 'R') {
+            if (s[1] == 'E') return OP_RET;
+        }
+        if (s[0] == 'S') {
+            if (s[1] == 'T') {
+                if (s[2] == 'O' && s[3] == 'R' && s[4] == 'E' && s[5] == 'I') return OP_STOREIDX;
+            }
+        }
+        if (s[0] == 'G') {
+            if (s[1] == 'A') return OP_GARRAY;
+        }
+        if (s[0] == 'M') {
+            if (s[1] == 'U') return OP_MUL;
+        }
+        }
     if (strcmp(s, "FUNC") == 0)      return OP_FUNC;
     if (strcmp(s, "ENDFUNC") == 0)   return OP_ENDFUNC;
     if (strcmp(s, "RET") == 0)       return OP_RET;
@@ -256,11 +327,11 @@ int qrun_ir_parse(const char* filename,
     qrun_instruction_t* code = malloc(1024 * sizeof(qrun_instruction_t));
     size_t capacity = 1024;
     size_t code_idx = 0;
+    qrun_instruction_t* instr;
     
     while (qrun_next_line(lex)) {
         char* op_str = qrun_next_token(lex);
         if (!op_str) continue;
-        
         qrun_opcode_t op = qrun_opcode_from_string(op_str);
         if (op == (qrun_opcode_t)(-1)) {
             fprintf(stderr, "Error: unknown opcode '%s'\n", op_str);
@@ -273,8 +344,9 @@ int qrun_ir_parse(const char* filename,
             code = grown;
             capacity *= 2;
         }
-        memset(&code[code_idx], 0, sizeof(qrun_instruction_t));
-        code[code_idx].op = op;
+        instr = qrun_instruction_at(code, code_idx);
+        memset(instr, 0, sizeof(qrun_instruction_t));
+        instr->op = op;
         
         /* Parse arguments based on opcode */
         char* arg_str = qrun_next_token(lex);
@@ -287,26 +359,26 @@ int qrun_ir_parse(const char* filename,
         case OP_STOREP:
         case OP_ADDRL:
             if (arg_str) {
-                code[code_idx].arg_i = atoi(arg_str);
+                instr->arg_i = atoi(arg_str);
             }
             break;
         
         case OP_FUNC: {
             if (arg_str) {
-                code[code_idx].arg_s = qrun_string_pool_intern(lex->pool, arg_str);
+                instr->arg_s = qrun_string_pool_intern(lex->pool, arg_str);
                 char* nargs_str = qrun_next_token(lex);
-                code[code_idx].arg_nargs = nargs_str ? atoi(nargs_str) : 0;
+                instr->arg_nargs = nargs_str ? atoi(nargs_str) : 0;
                 char* nlocals_str = qrun_next_token(lex);
-                code[code_idx].arg_func_nlocals = nlocals_str ? atoi(nlocals_str) : 0;
+                instr->arg_func_nlocals = nlocals_str ? atoi(nlocals_str) : 0;
             }
             break;
         }
         
         case OP_CALL: {
             if (arg_str) {
-                code[code_idx].arg_s = qrun_string_pool_intern(lex->pool, arg_str);
+                instr->arg_s = qrun_string_pool_intern(lex->pool, arg_str);
                 char* nargs_str = qrun_next_token(lex);
-                code[code_idx].arg_nargs = nargs_str ? atoi(nargs_str) : 0;
+                instr->arg_nargs = nargs_str ? atoi(nargs_str) : 0;
             }
             break;
         }
@@ -320,9 +392,9 @@ int qrun_ir_parse(const char* filename,
                 char* size_str = qrun_next_token(lex);
                 int size_val = size_str ? atoi(size_str) : 0;
                 
-                code[code_idx].arg_array_slot = slot_val;
-                code[code_idx].arg_type = type_str_intern;
-                code[code_idx].arg_array_size = size_val;
+                instr->arg_array_slot = slot_val;
+                instr->arg_type = type_str_intern;
+                instr->arg_array_size = size_val;
             }
             break;
         }
@@ -337,9 +409,9 @@ int qrun_ir_parse(const char* filename,
                 int size_val = size_str ? atoi(size_str) : 0;
                 char* init_str = qrun_next_token(lex);
                 
-                code[code_idx].arg_s = name;
-                code[code_idx].arg_type = type_str;
-                code[code_idx].arg_array_size = size_val;
+                instr->arg_s = name;
+                instr->arg_type = type_str;
+                instr->arg_array_size = size_val;
                 /* init is ignored for now */
             }
             break;
@@ -354,14 +426,14 @@ int qrun_ir_parse(const char* filename,
                 char* name_or_slot = qrun_next_token(lex);
                 
                 if (is_local) {
-                    code[code_idx].arg_array_slot = name_or_slot ? atoi(name_or_slot) : 0;
+                    instr->arg_array_slot = name_or_slot ? atoi(name_or_slot) : 0;
                 } else {
-                    code[code_idx].arg_s = name_or_slot ? qrun_string_pool_intern(lex->pool, name_or_slot) : NULL;
+                    instr->arg_s = name_or_slot ? qrun_string_pool_intern(lex->pool, name_or_slot) : NULL;
                 }
                 
                 char* type_str = qrun_next_token(lex);
-                code[code_idx].arg_type = type_str ? qrun_string_pool_intern(lex->pool, type_str) : NULL;
-                code[code_idx].arg_array_size = is_local ? 1 : 0;  /* Repurpose: size=0 means global */
+                instr->arg_type = type_str ? qrun_string_pool_intern(lex->pool, type_str) : NULL;
+                instr->arg_array_size = is_local ? 1 : 0;  /* Repurpose: size=0 means global */
             }
             break;
         }
@@ -371,7 +443,7 @@ int qrun_ir_parse(const char* filename,
             /* LOADIND/STOREIND carry the pointee type, e.g. "p" for a
                function/data pointer. */
             if (arg_str) {
-                code[code_idx].arg_type =
+                instr->arg_type =
                     qrun_string_pool_intern(lex->pool, arg_str);
             }
             break;
@@ -383,11 +455,11 @@ int qrun_ir_parse(const char* filename,
                 char* name_or_slot = qrun_next_token(lex);
                 
                 if (is_local) {
-                    code[code_idx].arg_array_slot = name_or_slot ? atoi(name_or_slot) : 0;
+                    instr->arg_array_slot = name_or_slot ? atoi(name_or_slot) : 0;
                 } else {
-                    code[code_idx].arg_s = name_or_slot ? qrun_string_pool_intern(lex->pool, name_or_slot) : NULL;
+                    instr->arg_s = name_or_slot ? qrun_string_pool_intern(lex->pool, name_or_slot) : NULL;
                 }
-                code[code_idx].arg_array_size = is_local ? 1 : 0;  /* Repurpose: size=0 means global */
+                instr->arg_array_size = is_local ? 1 : 0;  /* Repurpose: size=0 means global */
             }
             break;
         }
@@ -397,7 +469,7 @@ int qrun_ir_parse(const char* filename,
         case OP_PADD: {
             /* IPADD <type> or PADD <type>: type for size calculation */
             if (arg_str) {
-                code[code_idx].arg_type = qrun_string_pool_intern(lex->pool, arg_str);
+                instr->arg_type = qrun_string_pool_intern(lex->pool, arg_str);
             }
             break;
         }
@@ -405,7 +477,7 @@ int qrun_ir_parse(const char* filename,
         case OP_IPADDN: {
             /* IPADDN <size>: runtime size for offset calculation */
             if (arg_str) {
-                code[code_idx].arg_i = atoi(arg_str);
+                instr->arg_i = atoi(arg_str);
             }
             break;
         }
@@ -424,9 +496,9 @@ int qrun_ir_parse(const char* filename,
                 char* value_str = qrun_next_token(lex);
                 int32_t value = value_str ? (int32_t)atoi(value_str) : 0;
                 
-                code[code_idx].arg_s = name;
-                code[code_idx].arg_ginit_index = index;
-                code[code_idx].arg_ginit_value = value;
+                instr->arg_s = name;
+                instr->arg_ginit_index = index;
+                instr->arg_ginit_value = value;
             }
             break;
         }
@@ -442,10 +514,10 @@ int qrun_ir_parse(const char* filename,
                 char* init_str = qrun_next_token(lex);
                 int32_t init_val = init_str ? (int32_t)atoi(init_str) : 0;
                 
-                code[code_idx].arg_s = name;
-                code[code_idx].arg_global_scope = scope;
-                code[code_idx].arg_type = type_str;
-                code[code_idx].arg_global_init = init_val;
+                instr->arg_s = name;
+                instr->arg_global_scope = scope;
+                instr->arg_type = type_str;
+                instr->arg_global_init = init_val;
             }
             break;
         }
@@ -480,7 +552,7 @@ int qrun_ir_parse(const char* filename,
         case OP_BEQ:
         case OP_BNE:
             if (arg_str) {
-                code[code_idx].arg_s = qrun_string_pool_intern(lex->pool, arg_str);
+                instr->arg_s = qrun_string_pool_intern(lex->pool, arg_str);
             }
             break;
         

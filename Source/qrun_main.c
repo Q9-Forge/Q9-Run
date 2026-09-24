@@ -29,8 +29,8 @@ static int qrun_load_arch_file(qrun_vm_t* vm, const char* arch_file)
         
         /* Add global __ptrsize */
         if (vm->state[QRUN_NGLOBALS] < vm->state[QRUN_NGLOBALS_CAPACITY]) {
-            named_globals[vm->state[QRUN_NGLOBALS]].name = "__ptrsize";
-            named_globals[vm->state[QRUN_NGLOBALS]].value = value;
+            QRUN_GLOBAL_AT(named_globals, vm->state[QRUN_NGLOBALS]).name = "__ptrsize";
+            QRUN_GLOBAL_AT(named_globals, vm->state[QRUN_NGLOBALS]).value = value;
             vm->state[QRUN_NGLOBALS]++;
             fprintf(stderr, "Architecture: __ptrsize = %d\n", value);
         }
@@ -44,6 +44,8 @@ int main(int argc, char* argv[])
 {
     const char* ir_file = NULL;
     const char* arch_file = NULL;
+    int load_result;
+    int exit_code;
     
     /* Parse arguments: [--arch=FILE] IR_FILE */
     { int i;
@@ -75,13 +77,14 @@ int main(int argc, char* argv[])
         }
     }
     
-    if (qrun_vm_load_ir(vm, ir_file) != 0) {
+    load_result = qrun_vm_load_ir(vm, ir_file);
+    if (load_result != 0) {
         fprintf(stderr, "Failed to load IR from %s\n", ir_file);
         qrun_vm_destroy(vm);
         return 1;
     }
     
-    int exit_code = qrun_vm_run(vm);
+    exit_code = qrun_vm_run(vm);
     
     qrun_vm_destroy(vm);
     return exit_code;

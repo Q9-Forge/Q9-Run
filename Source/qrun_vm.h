@@ -110,6 +110,24 @@ typedef struct {
     int arg_global_scope;
     int32_t arg_global_init;
 } qrun_instruction_t;
+
+/* QCC lowers pointer indexing as byte addressing.  Make structure-array
+ * addressing explicit so generated code uses the record stride. */
+#ifdef QRUN_OS9
+#define QRUN_INSTRUCTION_BYTES 60
+#else
+#define QRUN_INSTRUCTION_BYTES sizeof(qrun_instruction_t)
+#endif
+static qrun_instruction_t* qrun_instruction_at(qrun_instruction_t* base, size_t index)
+{
+    char* p = (char*)base;
+    size_t n = 0;
+    while (n < index) {
+        p = p + QRUN_INSTRUCTION_BYTES;
+        n++;
+    }
+    return (qrun_instruction_t*)p;
+}
 typedef struct {
     char* name;
     size_t addr;
@@ -134,9 +152,18 @@ typedef struct {
     size_t code_addr;
     qrun_value_t* locals;
     size_t nlocals_allocated;
-    qrun_array_t* arrays;
+    qrun_value_t* array_data;
+    size_t* array_sizes;
+    int* array_type_sizes;
     size_t narrays;
 } qrun_frame_t;
+
+#define QRUN_FUNCTION_AT(b, i) b[i]
+#define QRUN_LABEL_AT(b, i) b[i]
+#define QRUN_GLOBAL_AT(b, i) b[i]
+#define QRUN_ARRAY_AT(b, i) b[i]
+#define QRUN_FRAME_AT(b, i) b[i]
+
 typedef qrun_value_t* qrun_handle_t;
 typedef struct {
     qrun_instruction_t* code;

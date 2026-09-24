@@ -6,6 +6,27 @@
 #include <string.h>
 #endif
 
+static qrun_value_t* qrun_value_offset(qrun_value_t* base, size_t index)
+{
+    char* p = (char*)base;
+    size_t n = 0;
+    while (n < index) {
+        p = p + 4;
+        n++;
+    }
+    return (qrun_value_t*)p;
+}
+static void qrun_value_store(qrun_value_t* base, size_t index, qrun_value_t value)
+{
+    qrun_value_t* p = qrun_value_offset(base, index);
+    *p = value;
+}
+static qrun_value_t qrun_value_load(qrun_value_t* base, size_t index)
+{
+    qrun_value_t* p = qrun_value_offset(base, index);
+    return *p;
+}
+
 /* =========================================================================
  * VM Creation & Initialization
  * ========================================================================= */
@@ -43,8 +64,10 @@ qrun_vm_t* qrun_vm_create(void)
     /* Initialize frames (clear arrays pointers) */
     { int i;
         for (i = 0; i < 256; i++) {
-        frames[i].arrays = NULL;
-        frames[i].narrays = 0;
+        QRUN_FRAME_AT(frames, i).array_data = NULL;
+        QRUN_FRAME_AT(frames, i).array_sizes = NULL;
+        QRUN_FRAME_AT(frames, i).array_type_sizes = NULL;
+        QRUN_FRAME_AT(frames, i).narrays = 0;
     }
         }
     
@@ -98,15 +121,10 @@ void qrun_vm_destroy(qrun_vm_t* vm)
     /* Destroy frame local arrays */
     { size_t i;
         for (i = 0; i < vm->state[QRUN_FP]; i++) {
-        free(frames[i].locals);
-        if (frames[i].arrays) {
-            { size_t j;
-        for (j = 0; j < frames[i].narrays; j++) {
-                /* Array views belong to vm->heap. */
-            }
-        }
-            free(frames[i].arrays);
-        }
+        free(QRUN_FRAME_AT(frames, i).locals);
+        free(QRUN_FRAME_AT(frames, i).array_data);
+        free(QRUN_FRAME_AT(frames, i).array_sizes);
+        free(QRUN_FRAME_AT(frames, i).array_type_sizes);
     }
         }
     free(vm->frames);
@@ -116,7 +134,7 @@ void qrun_vm_destroy(qrun_vm_t* vm)
     /* Destroy global arrays */
     { size_t i;
         for (i = 0; i < vm->state[QRUN_NGARRAYS]; i++) {
-        free(garrays[i].data);
+        free(QRUN_ARRAY_AT(garrays, i).data);
     }
         }
     free(vm->garrays);
@@ -141,6 +159,7 @@ int qrun_vm_load_ir(qrun_vm_t* vm, const char* filename)
     if (!vm || !filename) return -1;
     
     qrun_instruction_t* code = NULL;
+    qrun_instruction_t* item;
     size_t code_size = 0;
     void* pool = NULL;
     if (qrun_ir_parse(filename, &code, &code_size, &pool) != 0) {
@@ -152,29 +171,30 @@ int qrun_vm_load_ir(qrun_vm_t* vm, const char* filename)
     /* Build function, label, and global array lookup tables */
     { size_t i;
         for (i = 0; i < vm->state[QRUN_CODE_SIZE]; i++) {
-        if (code[i].op == OP_FUNC) {
+        item = qrun_instruction_at(code, i);
+        if (item->op == OP_FUNC) {
             if (vm->state[QRUN_NFUNCS] >= 256) {
                 fprintf(stderr, "Too many functions\n");
                 return -1;
             }
-            funcs[vm->state[QRUN_NFUNCS]].name = code[i].arg_s;
-            funcs[vm->state[QRUN_NFUNCS]].addr = i;
-            funcs[vm->state[QRUN_NFUNCS]].nargs = code[i].arg_nargs;
-            funcs[vm->state[QRUN_NFUNCS]].nlocals = code[i].arg_func_nlocals;
+            QRUN_FUNCTION_AT(funcs, vm->state[QRUN_NFUNCS]).name = item->arg_s;
+            QRUN_FUNCTION_AT(funcs, vm->state[QRUN_NFUNCS]).addr = i;
+            QRUN_FUNCTION_AT(funcs, vm->state[QRUN_NFUNCS]).nargs = item->arg_nargs;
+            QRUN_FUNCTION_AT(funcs, vm->state[QRUN_NFUNCS]).nlocals = item->arg_func_nlocals;
             vm->state[QRUN_NFUNCS]++;
-        } else if (code[i].op == OP_LABEL) {
+        } else if (item->op == OP_LABEL) {
             if (vm->state[QRUN_NLABELS] >= vm->state[QRUN_LABELS_CAPACITY]) {
                 fprintf(stderr, "Too many labels\n");
                 return -1;
             }
-            labels[vm->state[QRUN_NLABELS]].name = code[i].arg_s;
-            labels[vm->state[QRUN_NLABELS]].addr = i;
+            QRUN_LABEL_AT(labels, vm->state[QRUN_NLABELS]).name = item->arg_s;
+            QRUN_LABEL_AT(labels, vm->state[QRUN_NLABELS]).addr = i;
             vm->state[QRUN_NLABELS]++;
-        } else if (code[i].op == OP_GARRAY) {
+        } else if (item->op == OP_GARRAY) {
             /* Allocate global arrays at load time */
-            const char* name = code[i].arg_s;
-            const char* type = code[i].arg_type;
-            size_t size = code[i].arg_array_size;
+            const char* name = item->arg_s;
+            const char* type = item->arg_type;
+            size_t size = item->arg_array_size;
             int tsize = qrun_type_size(type);
             
             if (vm->state[QRUN_NGARRAYS] >= vm->state[QRUN_GARRAYS_CAPACITY]) {
@@ -187,23 +207,23 @@ int qrun_vm_load_ir(qrun_vm_t* vm, const char* filename)
                STOREIDX and the qccvm oracle for char/short/int arrays. */
             size_t nvalues = size;
 
-            garrays[vm->state[QRUN_NGARRAYS]].name = (char*)name;
-            garrays[vm->state[QRUN_NGARRAYS]].data = calloc(nvalues, sizeof(qrun_value_t));
-            garrays[vm->state[QRUN_NGARRAYS]].size = size;  /* Keep size as element count */
-            garrays[vm->state[QRUN_NGARRAYS]].type_size = tsize;
+            QRUN_ARRAY_AT(garrays, vm->state[QRUN_NGARRAYS]).name = (char*)name;
+            QRUN_ARRAY_AT(garrays, vm->state[QRUN_NGARRAYS]).data = calloc(nvalues, sizeof(qrun_value_t));
+            QRUN_ARRAY_AT(garrays, vm->state[QRUN_NGARRAYS]).size = size;  /* Keep size as element count */
+            QRUN_ARRAY_AT(garrays, vm->state[QRUN_NGARRAYS]).type_size = tsize;
             vm->state[QRUN_NGARRAYS]++;
-        } else if (code[i].op == OP_GLOBAL) {
+        } else if (item->op == OP_GLOBAL) {
             /* Register global variable at load time */
-            const char* name = code[i].arg_s;
-            int32_t init_val = code[i].arg_global_init;
+            const char* name = item->arg_s;
+            int32_t init_val = item->arg_global_init;
             
             if (vm->state[QRUN_NGLOBALS] >= 64) {
                 fprintf(stderr, "Too many global variables\n");
                 return -1;
             }
             
-            named_globals[vm->state[QRUN_NGLOBALS]].name = name;
-            named_globals[vm->state[QRUN_NGLOBALS]].value = init_val;
+            QRUN_GLOBAL_AT(named_globals, vm->state[QRUN_NGLOBALS]).name = name;
+            QRUN_GLOBAL_AT(named_globals, vm->state[QRUN_NGLOBALS]).value = init_val;
             vm->state[QRUN_NGLOBALS]++;
         }
     }
@@ -265,13 +285,12 @@ static qrun_value_t qrun_load_local(qrun_vm_t* vm, int slot)
     }
     
     size_t frame_idx = vm->state[QRUN_FP] - 1;
-    qrun_array_t* local_arrays = frames[frame_idx].arrays;
-    if (slot < 0 || slot >= (int)frames[frame_idx].nlocals_allocated) {
+    if (slot < 0 || slot >= (int)QRUN_FRAME_AT(frames, frame_idx).nlocals_allocated) {
         fprintf(stderr, "Local slot out of bounds: %d\n", slot);
         return 0;
     }
     
-    return frames[frame_idx].locals[slot];
+    return QRUN_FRAME_AT(frames, frame_idx).locals[slot];
 }
 
 static void qrun_store_local(qrun_vm_t* vm, int slot, qrun_value_t val)
@@ -283,13 +302,12 @@ static void qrun_store_local(qrun_vm_t* vm, int slot, qrun_value_t val)
     }
     
     size_t frame_idx = vm->state[QRUN_FP] - 1;
-    qrun_array_t* local_arrays = frames[frame_idx].arrays;
-    if (slot < 0 || slot >= (int)frames[frame_idx].nlocals_allocated) {
+    if (slot < 0 || slot >= (int)QRUN_FRAME_AT(frames, frame_idx).nlocals_allocated) {
         fprintf(stderr, "Local slot out of bounds: %d\n", slot);
         return;
     }
     
-    frames[frame_idx].locals[slot] = val;
+    QRUN_FRAME_AT(frames, frame_idx).locals[slot] = val;
 }
 
 /* =========================================================================
@@ -315,8 +333,8 @@ int qrun_vm_run(qrun_vm_t* vm)
     
     { size_t i;
         for (i = 0; i < vm->state[QRUN_NFUNCS]; i++) {
-        if (funcs[i].name && strcmp(funcs[i].name, "main") == 0) {
-            main_addr = funcs[i].addr;
+        if (QRUN_FUNCTION_AT(funcs, i).name && strcmp(QRUN_FUNCTION_AT(funcs, i).name, "main") == 0) {
+            main_addr = QRUN_FUNCTION_AT(funcs, i).addr;
             found_main = 1;
             break;
         }
@@ -332,13 +350,13 @@ int qrun_vm_run(qrun_vm_t* vm)
     vm->state[QRUN_HALTED] = 0;
     
     /* Push initial frame for main() */
-    frames[0].code_addr = vm->state[QRUN_CODE_SIZE];  /* Return address (end of program) */
-    frames[0].nlocals_allocated = 256;
-    frames[0].locals = calloc(256, sizeof(qrun_value_t));
+    QRUN_FRAME_AT(frames, 0).code_addr = vm->state[QRUN_CODE_SIZE];  /* Return address (end of program) */
+    QRUN_FRAME_AT(frames, 0).nlocals_allocated = 256;
+    QRUN_FRAME_AT(frames, 0).locals = calloc(256, sizeof(qrun_value_t));
     vm->state[QRUN_FP] = 1;
     
     while (!vm->state[QRUN_HALTED] && vm->state[QRUN_PC] < vm->state[QRUN_CODE_SIZE]) {
-        qrun_instruction_t* instr = vm->code + vm->state[QRUN_PC];
+        qrun_instruction_t* instr = qrun_instruction_at(vm->code, vm->state[QRUN_PC]);
         qrun_opcode_t op = instr->op;
         
         /* Decode & Execute */
@@ -392,8 +410,8 @@ int qrun_vm_run(qrun_vm_t* vm)
             /* Search named globals */
             { size_t i;
         for (i = 0; i < vm->state[QRUN_NGLOBALS]; i++) {
-                if (named_globals[i].name && strcmp(named_globals[i].name, name) == 0) {
-                    value = named_globals[i].value;
+                if (QRUN_GLOBAL_AT(named_globals, i).name && strcmp(QRUN_GLOBAL_AT(named_globals, i).name, name) == 0) {
+                    value = QRUN_GLOBAL_AT(named_globals, i).value;
                     qrun_push_value(vm, value);
                     found = 1;
                     break;
@@ -416,8 +434,8 @@ int qrun_vm_run(qrun_vm_t* vm)
             /* Search named globals */
             { size_t i;
         for (i = 0; i < vm->state[QRUN_NGLOBALS]; i++) {
-                if (named_globals[i].name && strcmp(named_globals[i].name, name) == 0) {
-                    named_globals[i].value = v;
+                if (QRUN_GLOBAL_AT(named_globals, i).name && strcmp(QRUN_GLOBAL_AT(named_globals, i).name, name) == 0) {
+                    QRUN_GLOBAL_AT(named_globals, i).value = v;
                     found = 1;
                     break;
                 }
@@ -440,8 +458,8 @@ int qrun_vm_run(qrun_vm_t* vm)
             /* Search named globals first */
             { size_t i;
         for (i = 0; i < vm->state[QRUN_NGLOBALS]; i++) {
-                if (named_globals[i].name && strcmp(named_globals[i].name, name) == 0) {
-                    value = named_globals[i].value;
+                if (QRUN_GLOBAL_AT(named_globals, i).name && strcmp(QRUN_GLOBAL_AT(named_globals, i).name, name) == 0) {
+                    value = QRUN_GLOBAL_AT(named_globals, i).value;
                     qrun_push_value(vm, value);
                     found = 1;
                     break;
@@ -465,8 +483,8 @@ int qrun_vm_run(qrun_vm_t* vm)
             /* Search named globals */
             { size_t i;
         for (i = 0; i < vm->state[QRUN_NGLOBALS]; i++) {
-                if (named_globals[i].name && strcmp(named_globals[i].name, name) == 0) {
-                    named_globals[i].value = v;
+                if (QRUN_GLOBAL_AT(named_globals, i).name && strcmp(QRUN_GLOBAL_AT(named_globals, i).name, name) == 0) {
+                    QRUN_GLOBAL_AT(named_globals, i).value = v;
                     found = 1;
                     break;
                 }
@@ -638,8 +656,8 @@ int qrun_vm_run(qrun_vm_t* vm)
             } else {
                 /* Return from function */
                 vm->state[QRUN_FP]--;
-                size_t ret_addr = frames[vm->state[QRUN_FP]].code_addr;
-                free(frames[vm->state[QRUN_FP]].locals);
+                size_t ret_addr = QRUN_FRAME_AT(frames, vm->state[QRUN_FP]).code_addr;
+                free(QRUN_FRAME_AT(frames, vm->state[QRUN_FP]).locals);
                 
                 vm->state[QRUN_PC] = ret_addr;
                 qrun_push_value(vm, ret_val);
@@ -668,7 +686,7 @@ int qrun_vm_run(qrun_vm_t* vm)
             
             { size_t i;
         for (i = 0; i < vm->state[QRUN_NFUNCS]; i++) {
-                if (funcs[i].name && strcmp(funcs[i].name, fname) == 0) {
+                if (QRUN_FUNCTION_AT(funcs, i).name && strcmp(QRUN_FUNCTION_AT(funcs, i).name, fname) == 0) {
                     func_idx = i;
                     found = 1;
                     break;
@@ -698,14 +716,14 @@ int qrun_vm_run(qrun_vm_t* vm)
                 break;
             }
             
-            frames[vm->state[QRUN_FP]].code_addr = vm->state[QRUN_PC] + 1;  /* +1 because PC is already incremented in the loop */
-            frames[vm->state[QRUN_FP]].nlocals_allocated = 256;  /* Allocate max slots */
-            frames[vm->state[QRUN_FP]].locals = calloc(256, sizeof(qrun_value_t));
+            QRUN_FRAME_AT(frames, vm->state[QRUN_FP]).code_addr = vm->state[QRUN_PC] + 1;  /* +1 because PC is already incremented in the loop */
+            QRUN_FRAME_AT(frames, vm->state[QRUN_FP]).nlocals_allocated = 256;  /* Allocate max slots */
+            QRUN_FRAME_AT(frames, vm->state[QRUN_FP]).locals = calloc(256, sizeof(qrun_value_t));
             
             /* Copy arguments to local slots 0..nargs-1 */
             { int i;
         for (i = 0; i < nargs; i++) {
-                frames[vm->state[QRUN_FP]].locals[i] = args[i];
+                QRUN_FRAME_AT(frames, vm->state[QRUN_FP]).locals[i] = args[i];
             }
         }
             
@@ -713,7 +731,7 @@ int qrun_vm_run(qrun_vm_t* vm)
             free(args);
             
             /* Jump to function */
-            vm->state[QRUN_PC] = funcs[func_idx].addr + 1;  /* Skip FUNC opcode */
+                vm->state[QRUN_PC] = QRUN_FUNCTION_AT(funcs, func_idx).addr + 1;  /* Skip FUNC opcode */
             should_increment = 0;  /* PC already set */
             break;
         }
@@ -726,8 +744,8 @@ int qrun_vm_run(qrun_vm_t* vm)
             const char* label_name = instr->arg_s;
             { size_t i;
         for (i = 0; i < vm->state[QRUN_NLABELS]; i++) {
-                if (labels[i].name && strcmp(labels[i].name, label_name) == 0) {
-                    vm->state[QRUN_PC] = labels[i].addr;
+                if (QRUN_LABEL_AT(labels, i).name && strcmp(QRUN_LABEL_AT(labels, i).name, label_name) == 0) {
+                    vm->state[QRUN_PC] = QRUN_LABEL_AT(labels, i).addr;
                     should_increment = 0;
                     break;
                 }
@@ -746,8 +764,8 @@ int qrun_vm_run(qrun_vm_t* vm)
                 const char* label_name = instr->arg_s;
                 { size_t i;
         for (i = 0; i < vm->state[QRUN_NLABELS]; i++) {
-                    if (labels[i].name && strcmp(labels[i].name, label_name) == 0) {
-                        vm->state[QRUN_PC] = labels[i].addr;
+                if (QRUN_LABEL_AT(labels, i).name && strcmp(QRUN_LABEL_AT(labels, i).name, label_name) == 0) {
+                    vm->state[QRUN_PC] = QRUN_LABEL_AT(labels, i).addr;
                         should_increment = 0;
                         break;
                     }
@@ -767,8 +785,8 @@ int qrun_vm_run(qrun_vm_t* vm)
                 const char* label_name = instr->arg_s;
                 { size_t i;
         for (i = 0; i < vm->state[QRUN_NLABELS]; i++) {
-                    if (labels[i].name && strcmp(labels[i].name, label_name) == 0) {
-                        vm->state[QRUN_PC] = labels[i].addr;
+                if (QRUN_LABEL_AT(labels, i).name && strcmp(QRUN_LABEL_AT(labels, i).name, label_name) == 0) {
+                    vm->state[QRUN_PC] = QRUN_LABEL_AT(labels, i).addr;
                         should_increment = 0;
                         break;
                     }
@@ -795,22 +813,27 @@ int qrun_vm_run(qrun_vm_t* vm)
             }
             
             size_t frame_idx = vm->state[QRUN_FP] - 1;
-    qrun_array_t* local_arrays = frames[frame_idx].arrays;
-            qrun_array_t* arrays = frames[frame_idx].arrays;
+            qrun_value_t* array_data = QRUN_FRAME_AT(frames, frame_idx).array_data;
+            size_t* array_sizes = QRUN_FRAME_AT(frames, frame_idx).array_sizes;
+            int* array_type_sizes = QRUN_FRAME_AT(frames, frame_idx).array_type_sizes;
             
             /* Expand arrays if needed */
-            if (slot >= (int)frames[frame_idx].narrays) {
+            if (slot >= (int)QRUN_FRAME_AT(frames, frame_idx).narrays) {
                 size_t new_size = slot + 1;
-                arrays = realloc(arrays, new_size * sizeof(qrun_array_t));
+                array_data = realloc(array_data, new_size * sizeof(qrun_value_t));
+                array_sizes = realloc(array_sizes, new_size * sizeof(size_t));
+                array_type_sizes = realloc(array_type_sizes, new_size * sizeof(int));
                 { size_t i;
-        for (i = frames[frame_idx].narrays; i < new_size; i++) {
-                    arrays[i].data = NULL;
-                    arrays[i].size = 0;
-                    arrays[i].type_size = 0;
+        for (i = QRUN_FRAME_AT(frames, frame_idx).narrays; i < new_size; i++) {
+                    array_data[i] = 0;
+                    array_sizes[i] = 0;
+                    array_type_sizes[i] = 0;
                 }
         }
-                frames[frame_idx].arrays = arrays;
-                frames[frame_idx].narrays = new_size;
+                QRUN_FRAME_AT(frames, frame_idx).array_data = array_data;
+                QRUN_FRAME_AT(frames, frame_idx).array_sizes = array_sizes;
+                QRUN_FRAME_AT(frames, frame_idx).array_type_sizes = array_type_sizes;
+                QRUN_FRAME_AT(frames, frame_idx).narrays = new_size;
             }
             
             /* Allocate array on heap instead of via calloc
@@ -827,14 +850,15 @@ int qrun_vm_run(qrun_vm_t* vm)
             size_t heap_start = vm->state[QRUN_HEAP_SIZE];
             { size_t i;
         for (i = 0; i < size; i++) {
-                vm->heap[vm->state[QRUN_HEAP_SIZE]++] = 0;
+                qrun_value_store(vm->heap, vm->state[QRUN_HEAP_SIZE], 0);
+                vm->state[QRUN_HEAP_SIZE]++;
             }
         }
             
             /* Point array.data to this heap space */
-            arrays[slot].data = vm->heap + heap_start;
-            arrays[slot].size = size;
-            arrays[slot].type_size = tsize;
+            qrun_value_store(QRUN_FRAME_AT(frames, frame_idx).locals, 240 + slot, heap_start);
+            qrun_value_store(QRUN_FRAME_AT(frames, frame_idx).locals, 200 + slot, size);
+            qrun_value_store(QRUN_FRAME_AT(frames, frame_idx).locals, 220 + slot, tsize);
             break;
         }
         
@@ -855,27 +879,28 @@ int qrun_vm_run(qrun_vm_t* vm)
                 }
                 
                 size_t frame_idx = vm->state[QRUN_FP] - 1;
-    qrun_array_t* local_arrays = frames[frame_idx].arrays;
-                if (slot < 0 || slot >= (int)frames[frame_idx].narrays) {
+                qrun_value_t* local_array_data = QRUN_FRAME_AT(frames, frame_idx).array_data;
+                size_t* local_array_sizes = QRUN_FRAME_AT(frames, frame_idx).array_sizes;
+                if (slot < 0 || slot >= (int)QRUN_FRAME_AT(frames, frame_idx).narrays) {
                     fprintf(stderr, "LOADIDX: array slot %d out of range\n", slot);
                     vm->state[QRUN_HALTED] = 1;
                     break;
                 }
                 
-                if (index < 0 || index >= (int)local_arrays[slot].size) {
+            if (index < 0 || index >= (int)qrun_value_load(QRUN_FRAME_AT(frames, frame_idx).locals, 200 + slot)) {
                     fprintf(stderr, "LOADIDX: array index out of bounds\n");
                     vm->state[QRUN_HALTED] = 1;
                     break;
                 }
                 
-                qrun_push_value(vm, local_arrays[slot].data[index]);
+                qrun_push_value(vm, qrun_value_load(vm->heap, qrun_value_load(QRUN_FRAME_AT(frames, frame_idx).locals, 240 + slot) + index));
             } else {
                 /* Global array */
                 const char* name = instr->arg_s;
                 int found = -1;
                 { size_t i;
         for (i = 0; i < vm->state[QRUN_NGARRAYS]; i++) {
-                    if (garrays[i].name && strcmp(garrays[i].name, name) == 0) {
+                    if (QRUN_ARRAY_AT(garrays, i).name && strcmp(QRUN_ARRAY_AT(garrays, i).name, name) == 0) {
                         found = i;
                         break;
                     }
@@ -888,13 +913,13 @@ int qrun_vm_run(qrun_vm_t* vm)
                     break;
                 }
                 
-                if (index < 0 || index >= (int)garrays[found].size) {
+                if (index < 0 || index >= (int)QRUN_ARRAY_AT(garrays, found).size) {
                     fprintf(stderr, "LOADIDX: array index out of bounds\n");
                     vm->state[QRUN_HALTED] = 1;
                     break;
                 }
                 
-                qrun_push_value(vm, garrays[found].data[index]);
+                qrun_push_value(vm, QRUN_ARRAY_AT(garrays, found).data[index]);
             }
             break;
         }
@@ -914,20 +939,21 @@ int qrun_vm_run(qrun_vm_t* vm)
                 }
                 
                 size_t frame_idx = vm->state[QRUN_FP] - 1;
-    qrun_array_t* local_arrays = frames[frame_idx].arrays;
-                if (slot < 0 || slot >= (int)frames[frame_idx].narrays) {
+                qrun_value_t* local_array_data = QRUN_FRAME_AT(frames, frame_idx).array_data;
+                size_t* local_array_sizes = QRUN_FRAME_AT(frames, frame_idx).array_sizes;
+                if (slot < 0 || slot >= (int)QRUN_FRAME_AT(frames, frame_idx).narrays) {
                     fprintf(stderr, "STOREIDX: array slot %d out of range\n", slot);
                     vm->state[QRUN_HALTED] = 1;
                     break;
                 }
                 
-                if (index < 0 || index >= (int)local_arrays[slot].size) {
+                if (index < 0 || index >= (int)qrun_value_load(QRUN_FRAME_AT(frames, frame_idx).locals, 200 + slot)) {
                     fprintf(stderr, "STOREIDX: array index out of bounds\n");
                     vm->state[QRUN_HALTED] = 1;
                     break;
                 }
                 
-                local_arrays[slot].data[index] = value;
+                qrun_value_store(vm->heap, qrun_value_load(QRUN_FRAME_AT(frames, frame_idx).locals, 240 + slot) + index, value);
             } else {
                 /* Global array */
                 const char* name = instr->arg_s;
@@ -935,7 +961,7 @@ int qrun_vm_run(qrun_vm_t* vm)
                 
                 { size_t i;
         for (i = 0; i < vm->state[QRUN_NGARRAYS]; i++) {
-                    if (garrays[i].name && strcmp(garrays[i].name, name) == 0) {
+                    if (QRUN_ARRAY_AT(garrays, i).name && strcmp(QRUN_ARRAY_AT(garrays, i).name, name) == 0) {
                         found = i;
                         break;
                     }
@@ -948,13 +974,13 @@ int qrun_vm_run(qrun_vm_t* vm)
                     break;
                 }
                 
-                if (index < 0 || index >= (int)garrays[found].size) {
+                if (index < 0 || index >= (int)QRUN_ARRAY_AT(garrays, found).size) {
                     fprintf(stderr, "STOREIDX: array index out of bounds\n");
                     vm->state[QRUN_HALTED] = 1;
                     break;
                 }
                 
-                garrays[found].data[index] = value;
+                QRUN_ARRAY_AT(garrays, found).data[index] = value;
             }
             break;
         }
@@ -996,7 +1022,7 @@ int qrun_vm_run(qrun_vm_t* vm)
             /* Search global arrays first */
             { size_t i;
         for (i = 0; i < vm->state[QRUN_NGARRAYS]; i++) {
-                if (garrays[i].name && strcmp(garrays[i].name, name) == 0) {
+                if (QRUN_ARRAY_AT(garrays, i).name && strcmp(QRUN_ARRAY_AT(garrays, i).name, name) == 0) {
                     /* Create handle pointer for global array */
                     if (vm->state[QRUN_NGARRAY_HANDLES] >= vm->state[QRUN_GARRAY_HANDLES_CAPACITY]) {
                         size_t new_capacity = vm->state[QRUN_GARRAY_HANDLES_CAPACITY] * 2;
@@ -1024,7 +1050,7 @@ int qrun_vm_run(qrun_vm_t* vm)
                         vm->garray_handle_indices = new_indices;
                         vm->state[QRUN_GARRAY_HANDLES_CAPACITY] = new_capacity;
                     }
-                    handles[vm->state[QRUN_NGARRAY_HANDLES]] = garrays[i].data;
+                    handles[vm->state[QRUN_NGARRAY_HANDLES]] = QRUN_ARRAY_AT(garrays, i).data;
                     vm->garray_handle_indices[vm->state[QRUN_NGARRAY_HANDLES]] = (int)i;  /* Store garray_idx */
                     int handle_idx = (int)vm->state[QRUN_NGARRAY_HANDLES];
                     vm->state[QRUN_NGARRAY_HANDLES]++;
@@ -1042,7 +1068,7 @@ int qrun_vm_run(qrun_vm_t* vm)
             if (!found) {
                 { size_t i;
         for (i = 0; i < vm->state[QRUN_NGLOBALS]; i++) {
-                    if (named_globals[i].name && strcmp(named_globals[i].name, name) == 0) {
+                    if (QRUN_GLOBAL_AT(named_globals, i).name && strcmp(QRUN_GLOBAL_AT(named_globals, i).name, name) == 0) {
                         qrun_value_t addr = -(2000 + i);
                         qrun_push_value(vm, addr);
                         found = 1;
@@ -1324,8 +1350,8 @@ int qrun_vm_run(qrun_vm_t* vm)
                 }
                 
                 size_t frame_idx = vm->state[QRUN_FP] - 1;
-    qrun_array_t* local_arrays = frames[frame_idx].arrays;
-                if (slot >= (int)frames[frame_idx].narrays) {
+                qrun_value_t* local_array_data = QRUN_FRAME_AT(frames, frame_idx).array_data;
+                if (slot >= (int)QRUN_FRAME_AT(frames, frame_idx).narrays) {
                     fprintf(stderr, "PUSHADDR: local slot %d not allocated\n", slot);
                     vm->state[QRUN_HALTED] = 1;
                     break;
@@ -1333,7 +1359,7 @@ int qrun_vm_run(qrun_vm_t* vm)
                 
                 /* Get the heap index from array.data pointer
                    heap_start = arrays[slot].data - vm->heap */
-                qrun_value_t* array_ptr = local_arrays[slot].data;
+                qrun_value_t* array_ptr = vm->heap + qrun_value_load(QRUN_FRAME_AT(frames, frame_idx).locals, 240 + slot);
                 if (array_ptr == NULL) {
                     fprintf(stderr, "PUSHADDR: local array at slot %d is NULL\n", slot);
                     vm->state[QRUN_HALTED] = 1;
@@ -1362,7 +1388,7 @@ int qrun_vm_run(qrun_vm_t* vm)
                 int global_idx = -1;
                 { size_t i;
         for (i = 0; i < vm->state[QRUN_NGARRAYS]; i++) {
-                    if (garrays[i].name && strcmp(garrays[i].name, name) == 0) {
+                    if (QRUN_ARRAY_AT(garrays, i).name && strcmp(QRUN_ARRAY_AT(garrays, i).name, name) == 0) {
                         global_idx = i;
                         break;
                     }
@@ -1385,7 +1411,7 @@ int qrun_vm_run(qrun_vm_t* vm)
                 }
                 
                 size_t handle_idx = vm->state[QRUN_NGARRAY_HANDLES];
-                handles[handle_idx] = garrays[global_idx].data;
+                handles[handle_idx] = QRUN_ARRAY_AT(garrays, global_idx).data;
                 vm->state[QRUN_NGARRAY_HANDLES]++;
                 
                 /* Encoding: use block_id = 256 + handle_idx to encode handle in block_id
@@ -1411,7 +1437,7 @@ int qrun_vm_run(qrun_vm_t* vm)
             int garray_idx = -1;
             { size_t i;
         for (i = 0; i < vm->state[QRUN_NGARRAYS]; i++) {
-                if (garrays[i].name && strcmp(garrays[i].name, garray_name) == 0) {
+                if (QRUN_ARRAY_AT(garrays, i).name && strcmp(QRUN_ARRAY_AT(garrays, i).name, garray_name) == 0) {
                     garray_idx = (int)i;
                     break;
                 }
@@ -1424,9 +1450,9 @@ int qrun_vm_run(qrun_vm_t* vm)
                 break;
             }
             
-            if (index < 0 || index >= (int)garrays[garray_idx].size) {
+            if (index < 0 || index >= (int)QRUN_ARRAY_AT(garrays, garray_idx).size) {
                 fprintf(stderr, "GINIT: array index %d out of bounds for '%s' (size %zu)\n", 
-                        index, garray_name, garrays[garray_idx].size);
+                        index, garray_name, QRUN_ARRAY_AT(garrays, garray_idx).size);
                 vm->state[QRUN_HALTED] = 1;
                 break;
             }
@@ -1434,8 +1460,8 @@ int qrun_vm_run(qrun_vm_t* vm)
             /* Store value in array at byte offset
                index is element number, convert to byte offset
                Cast to char* for byte-level access */
-            int tsize = garrays[garray_idx].type_size;
-            char* byte_ptr = (char*)garrays[garray_idx].data;
+            int tsize = QRUN_ARRAY_AT(garrays, garray_idx).type_size;
+            char* byte_ptr = (char*)QRUN_ARRAY_AT(garrays, garray_idx).data;
             byte_ptr[index * tsize] = (unsigned char)value;
             break;
         }
