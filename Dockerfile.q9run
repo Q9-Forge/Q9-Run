@@ -1,0 +1,29 @@
+FROM ubuntu:22.04
+
+# Install basic tools
+RUN apt-get update && apt-get install -y \
+    wine64 \
+    wine32 \
+    dos2unix \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy MWOS tools (r68, l68)
+COPY /Volumes/SSD1TB/projects/MWOS/DOS/BIN/r68.exe /opt/mwos/r68.exe
+COPY /Volumes/SSD1TB/projects/MWOS/DOS/BIN/l68.exe /opt/mwos/l68.exe
+
+# Wine setup
+ENV WINEPREFIX=/root/.wine
+ENV WINEARCH=win64
+
+# Wrapper scripts
+RUN echo '#!/bin/bash' > /usr/local/bin/r68 && \
+    echo 'wine /opt/mwos/r68.exe "$@"' >> /usr/local/bin/r68 && \
+    chmod +x /usr/local/bin/r68
+
+RUN echo '#!/bin/bash' > /usr/local/bin/l68 && \
+    echo 'wine /opt/mwos/l68.exe "$@"' >> /usr/local/bin/l68 && \
+    chmod +x /usr/local/bin/l68
+
+WORKDIR /work
+CMD ["/bin/bash"]
