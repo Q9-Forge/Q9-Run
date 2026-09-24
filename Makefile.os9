@@ -1,0 +1,77 @@
+# Q9-Run Microware r68/l68 Build Chain
+# Ziel: qrun.s68k → qrun.r → qrun.mod
+# Voraussetzung: r68 + l68 lokal verfügbar (Linux/Wine)
+
+QCC_DIR = /Volumes/SSD1TB/projects/Q9-Forge/Q9-QCC
+QIR68K = $(QCC_DIR)/Q9-BACKEND-68K/q9-qir68k/build/qir68k
+QCSTART = $(QCC_DIR)/Q9-BACKEND-68K/q9-qclib/build/q9_cstart.r
+QCLIB = $(QCC_DIR)/Q9-BACKEND-68K/q9-qclib/build/qclib.l
+
+# Lokale oder externe Tools
+R68 ?= r68
+L68 ?= l68
+
+SOURCE_DIR = Source
+BUILD_DIR = build_os9
+TMPDIR = $(BUILD_DIR)/tmp
+
+# Input/Output
+IR_FILE = $(TMPDIR)/qrun.ir
+ASM_FILE = $(TMPDIR)/qrun.s68k
+OBJ_FILE = $(BUILD_DIR)/qrun.r
+MOD_FILE = $(BUILD_DIR)/qrun.mod
+MAP_FILE = $(BUILD_DIR)/qrun.map
+
+.PHONY: all clean asm obj mod
+
+all: $(MOD_FILE)
+
+# Phase 2: IR → ASM (via qir68k)
+$(ASM_FILE): $(IR_FILE)
+	@mkdir -p $(BUILD_DIR)/tmp
+	$(QIR68K) $< $@ -os9 -largedata
+
+# Phase 3: ASM → Object (via r68)
+$(OBJ_FILE): $(ASM_FILE)
+	@echo "=== r68 Assembly ==="
+	$(R68) -a=$< -o=$@ 2>&1 || { \
+		echo "✗ r68 nicht verfügbar (Linux/Wine needed)"; \
+		echo "  Benutze alternative Methode oder versuche manuell..."; \
+		exit 1; \
+	}
+
+# Phase 4: Link (via l68)
+$(MOD_FILE): $(OBJ_FILE)
+	@echo "=== l68 Linker ==="
+	$(L68) \
+		$(QCSTART) $< \
+		-l=$(QCLIB) \
+		-o=$@ \
+		-m=$(MAP_FILE) || { \
+		echo "✗ l68 nicht verfügbar"; \
+		exit 1; \
+	}
+
+# Shortcut targets
+asm: $(ASM_FILE)
+	@echo "✓ ASM erzeugt: $<"
+	@wc -l $<
+
+obj: $(OBJ_FILE)
+	@echo "✓ Object erzeugt: $<"
+	@ls -lh $<
+
+mod: $(MOD_FILE)
+	@echo "✓ Modul erzeugt: $<"
+	@ls -lh $<
+	@echo "  Map: $(MAP_FILE)"
+
+clean:
+	rm -rf $(BUILD_DIR)
+
+help:
+	@echo "Targets:"
+	@echo "  asm  - Generate 68k-ASM"
+	@echo "  obj  - Assemble to .r object (needs r68)"
+	@echo "  mod  - Link to OS-9 module (needs l68)"
+	@echo "  all  - Complete chain (ASM → OBJ → MOD)"
