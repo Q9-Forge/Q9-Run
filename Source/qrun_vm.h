@@ -207,4 +207,17 @@ void       qrun_vm_destroy(qrun_vm_t* vm);
 int        qrun_vm_load_ir(qrun_vm_t* vm, const char* filename);
 int        qrun_vm_run(qrun_vm_t* vm);
 
+/* Value/stack/local helpers -- defined in qrun_vmhelpers.c, split out of
+ * qrun_vm.c so qrun_vm_run()'s calls into them are cross-module
+ * references instead of same-module bsr (see that file for why). */
+qrun_value_t* qrun_value_offset(qrun_value_t* base, size_t index);
+void          qrun_value_store(qrun_value_t* base, size_t index, qrun_value_t value);
+qrun_value_t  qrun_value_load(qrun_value_t* base, size_t index);
+void          qrun_push_value(qrun_vm_t* vm, qrun_value_t v);
+qrun_value_t  qrun_pop_value(qrun_vm_t* vm);
+qrun_value_t  qrun_peek_value(qrun_vm_t* vm);
+int           qrun_type_size(const char* type);
+qrun_value_t  qrun_load_local(qrun_vm_t* vm, int slot);
+void          qrun_store_local(qrun_vm_t* vm, int slot, qrun_value_t val);
+
 #endif /* QRUN_VM_H */
